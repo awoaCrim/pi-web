@@ -451,7 +451,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const modelSwitchPendingRef = useRef(false);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
-  // In-flight session reads, keyed by session id (or force:<id> for fresh reads).
+  // A newer read or unmount invalidates the entire response, including errors.
+  const sessionReadIdRef = useRef(0);
+  const sessionReadAbortRef = useRef<AbortController | null>(null);
+  const historyEventVersionRef = useRef(0);
+  // Reads can coalesce only while no completed live message has changed history.
   const loadFlightsRef = useRef(new Map<string, Promise<unknown>>());
   // Latest settled view state, readable from the unmount cleanup without
   // re-subscribing it. Assigned every render like sessionPropIdRef below.
@@ -635,19 +639,81 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyContextUsage]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean; fastTranscript?: boolean }) => {
     // Single-flight: concurrent reads for the same session (mount + SSE settle +
     // reconcile) share one request unless the caller forces a fresh read.
-    const flightKey = options?.force ? `force:${sid}` : sid;
+    const flightKey = `${sid}:${historyEventVersionRef.current}:${includeState}`;
     const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
+    const requestId = ++sessionReadIdRef.current;
+    sessionReadAbortRef.current?.abort();
+    const controller = new AbortController();
+    sessionReadAbortRef.current = controller;
+    const isCurrent = () => !controller.signal.aborted
+      && sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && sessionReadIdRef.current === requestId;
   const flight = (async (): Promise<unknown> => {
     let messagesLoaded = false;
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", tree: "summary" });
       if (options?.force) params.set("force", "1");
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      // A message_end received while a response was in flight must not be
+      // erased by that older snapshot. Re-read within this flight; a newer
+      // caller or unmount aborts the loop. Streamed partials stay SSE-owned.
+      const read = async (query: URLSearchParams) => {
+        while (isCurrent()) {
+          const version = historyEventVersionRef.current;
+          const response = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${query}`, { signal: controller.signal });
+          if (!isCurrent()) return null;
+          if (!response.ok) return { response, value: null };
+          const value = await response.json() as SessionData;
+          if (!isCurrent()) return null;
+          if (version === historyEventVersionRef.current) return { response, value };
+        }
+        return null;
+      };
+
+      if (options?.fastTranscript) {
+        const fastParams = new URLSearchParams(params);
+        fastParams.set("view", "transcript");
+        try {
+          const fast = await read(fastParams);
+          if (!isCurrent()) return null;
+          if (fast?.value) {
+            const fresh = fast.value;
+            const cached = getSessionViewSnapshot(sid);
+            // An unchanged revision preserves the complete paged-in window.
+            if (!fresh.snapshotRevision || cached?.revision !== fresh.snapshotRevision) {
+              setMessages(fresh.context.messages);
+              setEntryIds(fresh.context.entryIds ?? []);
+              setActiveLeafId(fresh.leafId);
+              setHistoryCursor(fresh.context.oldestEntryId);
+              setHasEarlierMessages(fresh.context.hasMore);
+              setEarlierTurnCount(fresh.context.turnsBefore ?? 0);
+              setData((previous) => previous ? {
+                ...previous, context: fresh.context, leafId: fresh.leafId,
+                // Metadata belongs to the old read; never persist it with the
+                // new transcript's revision while enrichment is pending.
+                snapshotRevision: null,
+              } : previous);
+              dataRef.current = null;
+              deleteSessionViewSnapshot(sid);
+            }
+            if (fresh.wrapperRebuilt) {
+              eventConnectionRef.current?.close();
+              eventConnectionRef.current?.maintain(sid);
+            }
+          }
+        } catch {
+          if (!isCurrent()) return null;
+          // Older servers or a failed fast path still get the normal read.
+        }
+      }
+      const full = await read(params);
+      if (!full || !isCurrent()) return null;
+      const { response: res, value } = full;
       if (res.status === 404) {
         if (showLoading) {
           setData(null);
@@ -663,8 +729,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      const d = value!;
       // Freshness check: when the disk snapshot is unchanged (same opaque
       // revision), keep any history the user already paged in instead of
       // collapsing back to the fresh 50-entry window. The state hooks then
@@ -690,26 +755,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           }
         : d);
       setActiveLeafId(d.leafId);
-      if (revisionUnchanged) {
-        // Refresh the cached snapshot with the newest leaf/tree/stats while
-        // preserving the wider loaded window.
-        setSessionViewSnapshot({
-          sessionId: sid,
-          revision: d.snapshotRevision!,
-          messages: messagesRef.current,
-          entryIds: entryIdsRef.current,
-          leafId: d.leafId,
-          oldestEntryId: historyCursorRef.current,
-          hasMore: hasEarlierMessagesRef.current,
-          turnsBefore: earlierTurnCountRef.current,
-          summaryTree: d.tree,
-          thinkingLevel: d.context.thinkingLevel,
-          model: d.context.model,
-          stats: d.stats,
-          totalActiveMs: d.totalActiveMs,
-          loadedEntryIds: entryIdsRef.current,
-        });
-      } else {
+      if (!revisionUnchanged) {
         setMessages(persistedMessages);
         setEntryIds(d.context.entryIds ?? []);
         setHistoryCursor(d.context.oldestEntryId);
@@ -728,17 +774,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           sessionId: sid,
           revision: d.snapshotRevision,
           messages: persistedMessages,
-          entryIds: d.context.entryIds ?? [],
+          entryIds: revisionUnchanged ? entryIdsRef.current : d.context.entryIds ?? [],
           leafId: d.leafId,
-          oldestEntryId: d.context.oldestEntryId,
-          hasMore: d.context.hasMore,
-          turnsBefore: d.context.turnsBefore ?? 0,
+          oldestEntryId: revisionUnchanged ? historyCursorRef.current : d.context.oldestEntryId,
+          hasMore: revisionUnchanged ? hasEarlierMessagesRef.current : d.context.hasMore,
+          turnsBefore: revisionUnchanged ? earlierTurnCountRef.current : d.context.turnsBefore ?? 0,
           summaryTree: d.tree,
           thinkingLevel: d.context.thinkingLevel,
           model: d.context.model,
           stats: d.stats,
           totalActiveMs: d.totalActiveMs,
-          loadedEntryIds: d.context.entryIds ?? [],
+          loadedEntryIds: revisionUnchanged ? entryIdsRef.current : d.context.entryIds ?? [],
         });
       }
       if (d.wrapperRebuilt) {
@@ -750,16 +796,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
 
       messagesLoaded = true;
-      if (showLoading) setLoading(false);
+      setLoading(false);
       if (!includeState) return null;
 
       try {
         const runId = promptRunIdRef.current;
         const usageRequestId = ++contextUsageRequestIdRef.current;
-        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
+        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, { signal: controller.signal });
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (!isCurrent()) return null;
 
         const liveState = agentState.state;
         syncLiveModel(liveState);
@@ -775,14 +821,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         return agentState;
       } catch (e) {
-        console.error("Failed to load agent state:", e);
+        if (isCurrent()) console.error("Failed to load agent state:", e);
         return null;
       }
     } catch (e) {
+      if (!isCurrent()) return null;
       setError(String(e));
       return "error";
     } finally {
-      if (showLoading && !messagesLoaded) setLoading(false);
+      if (isCurrent() && !messagesLoaded) setLoading(false);
     }
     })();
     if (!options?.force) loadFlightsRef.current.set(flightKey, flight);
@@ -1566,6 +1613,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "message_end": {
+        historyEventVersionRef.current += 1;
         // Same late-event guard: after reconcile finished this run,
         // loadSession already loaded this message from the session file —
         // appending it again would duplicate it.
@@ -2545,7 +2593,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setError(null);
         setLoading(false);
       }
-      loadSession(session.id, !cached, true, { force: true }).then((loadedAgentState) => {
+      loadSession(session.id, !cached, true, { force: true, fastTranscript: Boolean(cached) }).then((loadedAgentState) => {
+        if (!sessionHookMountedRef.current || sessionIdRef.current !== session.id) return;
         const agentState = loadedAgentState as { running: boolean; state?: AgentStateResponse } | null;
         if (agentState?.running) {
           loadTools(session.id);
@@ -2577,6 +2626,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     return () => {
       sessionHookMountedRef.current = false;
+      sessionReadIdRef.current += 1;
+      sessionReadAbortRef.current?.abort();
+      loadFlightsRef.current.clear();
       const abandonedDraftKey = isNew ? newSessionDraftKey : null;
       if (abandonedDraftKey) {
         queueMicrotask(() => {

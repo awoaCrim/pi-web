@@ -365,3 +365,44 @@ test("session detail returns a gzip-compressed response when the client accepts 
   const payload = JSON.parse(gunzipSync(Buffer.from(await response.arrayBuffer())).toString("utf8"));
   assert.equal(payload.info.firstMessage, firstMessage);
 });
+
+test("transcript catch-up bypasses tree, statistics and project metadata work", async (t) => {
+  const previousRegistry = globalThis.__piSessions;
+  const id = "fast-transcript-route-test";
+  const entry = {
+    type: "message", id: "u1", parentId: null,
+    timestamp: "2026-10-13T00:00:00.000Z",
+    message: { role: "user", content: "latest confirmed message" },
+  };
+  let forceProbes = 0;
+  const manager = {
+    getEntries: () => [entry],
+    getLeafId: () => entry.id,
+    getSessionFile: () => "",
+    getTree: () => { throw new Error("fast transcript must not build a tree"); },
+    getSessionName: () => { throw new Error("fast transcript must not load metadata"); },
+    getHeader: () => { throw new Error("fast transcript must not resolve project info"); },
+  };
+  globalThis.__piSessions = new Map([[id, {
+    isAlive: () => true,
+    isRunning: () => true,
+    evictIfDiskAhead: () => { forceProbes++; return false; },
+    inner: { sessionManager: manager, sessionId: id },
+    sessionFile: "",
+  }]]);
+  t.after(() => { globalThis.__piSessions = previousRegistry; });
+
+  const response = await getSessionDetail(
+    new Request(`http://localhost/api/sessions/${id}?view=transcript&force=1&deferThinking=1&deferMedia=1`),
+    { params: Promise.resolve({ id }) },
+  );
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(result.context.messages.map((message) => message.content), ["latest confirmed message"]);
+  assert.deepEqual(result.context.entryIds, ["u1"]);
+  assert.equal(result.leafId, "u1");
+  assert.equal(forceProbes, 1, "the fast route must keep the forced freshness check");
+  assert.equal("stats" in result, false);
+  assert.equal("tree" in result, false);
+  assert.equal("info" in result, false);
+});

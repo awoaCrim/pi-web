@@ -55,11 +55,6 @@ export async function GET(
     const filePath = liveRpc?.sessionFile || sm.getSessionFile() || resolvedPath || "";
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
-    const summaryTree = searchParams.get("tree") === "summary";
-    const tree = summaryTree
-      ? toSummaryTree(projectTreeForResponse(sm.getTree()))
-      : projectTreeForResponse(sm.getTree());
-    perf?.span("tree");
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const rawTail = Number(searchParams.get("tail"));
@@ -71,12 +66,6 @@ export async function GET(
       sessionId: id, // local: lazy URLs for historical tool-result images
     });
     perf?.span("context");
-    const totalActiveMs = computeSessionTotalActiveMs(entries);
-    // Cumulative usage over ALL entries, including history compacted away —
-    // the same aggregation the SDK's getSessionStats() uses. Lets the client
-    // keep monotonic token/cost counters across compaction and page reloads.
-    const stats = computeSessionStats(entries as unknown as SessionEntry[]);
-    perf?.span("stats");
     // Opaque freshness token for the session view cache. Derived from the
     // disk fingerprint and the actual read source; null tells the client the
     // snapshot is unstable and must not be cached as fresh.
@@ -88,6 +77,32 @@ export async function GET(
       latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
       leafId: leafId ?? null,
     });
+
+    // A revisited chat already has metadata. Catch its transcript up before
+    // constructing the whole branch tree, cumulative stats and project info.
+    // This uses the same force/eviction and revision rules as a full read.
+    if (searchParams.get("view") === "transcript") {
+      const response = jsonResponse(req, {
+        sessionId: id,
+        leafId,
+        snapshotRevision,
+        context,
+        ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
+      });
+      return perf?.attach(response) ?? response;
+    }
+
+    const summaryTree = searchParams.get("tree") === "summary";
+    const tree = summaryTree
+      ? toSummaryTree(projectTreeForResponse(sm.getTree()))
+      : projectTreeForResponse(sm.getTree());
+    perf?.span("tree");
+    const totalActiveMs = computeSessionTotalActiveMs(entries);
+    // Cumulative usage over ALL entries, including history compacted away —
+    // the same aggregation the SDK's getSessionStats() uses. Lets the client
+    // keep monotonic token/cost counters across compaction and page reloads.
+    const stats = computeSessionStats(entries as unknown as SessionEntry[]);
+    perf?.span("stats");
     const sessionName = sm.getSessionName();
     const firstUserEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
     const firstUserMessage = firstUserEntry?.type === "message" ? firstUserEntry.message : undefined;
